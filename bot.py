@@ -91,6 +91,45 @@ async def start_cmd(message: types.Message):
         reply_markup=keyboard
     )
 
+# --- АДМИН-КОМАНДА ДЛЯ ДОБАВЛЕНИЯ КОНТЕНТА ---
+# ВАЖНО: Укажите ниже ваш реальный Telegram ID
+ADMIN_ID = 298207628  # ЗДЕСЬ ВСТАВЬТЕ ВАШ ID (число, без кавычек)
+
+@dp.message(Command('add'))
+async def admin_add_content(message: types.Message):
+    # Проверка: является ли отправитель админом
+    if message.from_user.id != ADMIN_ID:
+        await message.answer("⛔ У вас нет прав на эту команду.")
+        return
+
+    # Команда должна быть в формате: /add text|Текст воспоминания или /add photo|https://ссылка.jpg|Подпись
+    args = message.text.split('|')
+    if len(args) < 2:
+        await message.answer("❌ Неверный формат.\nИспользуйте:\n`/add text|ваш текст`\n`/add photo|URL_картинки|подпись`", parse_mode="Markdown")
+        return
+
+    media_type = args[0].replace('/add ', '').strip().lower()
+    conn = sqlite3.connect('nostalgia.db')
+    c = conn.cursor()
+
+    if media_type == 'text':
+        caption = args[1]
+        c.execute('INSERT INTO content (media_type, caption, era, status) VALUES (?, ?, ?, ?)',
+                  ('text', caption, 'admin', 'approved'))
+        await message.answer(f"✅ Текст добавлен:\n`{caption[:50]}...`", parse_mode="Markdown")
+    elif media_type == 'photo':
+        if len(args) < 3:
+            await message.answer("❌ Для фото укажите и ссылку, и подпись.")
+            return
+        photo_url, caption = args[1], args[2]
+        c.execute('INSERT INTO content (media_type, media_url, caption, era, status) VALUES (?, ?, ?, ?, ?)',
+                  ('photo', photo_url, caption, 'admin', 'approved'))
+        await message.answer(f"✅ Фото добавлено:\n`{caption[:50]}...`", parse_mode="Markdown")
+    else:
+        await message.answer("❌ Поддерживаются только `text` и `photo`.", parse_mode="Markdown")
+
+    conn.commit()
+    conn.close()
 @dp.callback_query(lambda c: c.data == "howto")
 async def howto_callback(callback: types.CallbackQuery):
     await callback.message.answer(
