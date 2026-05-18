@@ -7,6 +7,7 @@ import random
 import io
 import urllib.parse
 import uuid
+import aiohttp                     # <--- ДОБАВЛЕН ЯВНЫЙ ИМПОРТ
 
 # --- Библиотеки для веб-сервера и бота ---
 from aiohttp import web
@@ -239,7 +240,6 @@ async def admin_gen_post(message: types.Message):
         await message.answer("❌ Укажите тему поста.\nПример: `/gen Воспоминания о видеосалонах`", parse_mode="Markdown")
         return
 
-    # Получаем переменные окружения для GigaChat
     GIGACHAT_CREDENTIALS = os.environ.get("GIGACHAT_CREDENTIALS")
     GIGACHAT_SCOPE = os.environ.get("GIGACHAT_SCOPE", "GIGACHAT_API_PERS")
     if not GIGACHAT_CREDENTIALS:
@@ -261,7 +261,7 @@ async def admin_gen_post(message: types.Message):
         await status_msg.edit_text(f"❌ Не удалось сгенерировать текст. Ошибка: {generated_text}")
         return
 
-    # --- 2. Генерация изображения через Pollinations.ai (без ключа) ---
+    # --- 2. Генерация изображения через Pollinations.ai ---
     image_prompt = f"nostalgic atmosphere, warm memory style, retro vibes, {topic}, cozy, detailed, 8k resolution, no text"
     encoded_prompt = urllib.parse.quote(image_prompt)
     image_url = f"https://image.pollinations.ai/prompt/{encoded_prompt}?width=1024&height=1024&nologo=true"
@@ -273,7 +273,6 @@ async def admin_gen_post(message: types.Message):
             async with session.get(image_url, timeout=30) as resp:
                 if resp.status == 200:
                     image_data = await resp.read()
-                    # Сохраняем в БД с типом photo и URL (можно сохранить и локально, но URL рабочий)
                     c.execute('INSERT INTO content (media_type, media_url, caption, status) VALUES (?, ?, ?, ?)',
                               ('photo', image_url, generated_text, 'approved'))
                     conn.commit()
@@ -283,7 +282,6 @@ async def admin_gen_post(message: types.Message):
                         parse_mode="Markdown"
                     )
                 else:
-                    # Если картинку не получили, сохраняем только текст
                     c.execute('INSERT INTO content (media_type, caption, status) VALUES (?, ?, ?)',
                               ('text', generated_text, 'approved'))
                     conn.commit()
