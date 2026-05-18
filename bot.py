@@ -7,7 +7,8 @@ import random
 import io
 import urllib.parse
 import uuid
-import aiohttp                     # <--- ДОБАВЛЕН ЯВНЫЙ ИМПОРТ
+import aiohttp
+import ssl                         # <--- добавлено для SSL
 
 # --- Библиотеки для веб-сервера и бота ---
 from aiohttp import web
@@ -82,9 +83,9 @@ def add_user(user_id, username, first_name):
 
 init_db()
 
-# ========== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ДЛЯ GigaChat ==========
+# ========== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ДЛЯ GigaChat (с отключенной проверкой SSL) ==========
 async def get_gigachat_token(creds: str, scope: str) -> str:
-    """Получение токена доступа GigaChat"""
+    """Получение токена доступа GigaChat с отключенной проверкой SSL"""
     auth_url = "https://ngw.devices.sberbank.ru:9443/api/v2/oauth"
     headers = {
         "Authorization": f"Bearer {creds}",
@@ -92,7 +93,14 @@ async def get_gigachat_token(creds: str, scope: str) -> str:
         "RqUID": str(uuid.uuid4())
     }
     data = {"scope": scope}
-    async with aiohttp.ClientSession() as session:
+    
+    # Создаём SSL-контекст, который не проверяет сертификаты
+    ssl_context = ssl.create_default_context()
+    ssl_context.check_hostname = False
+    ssl_context.verify_mode = ssl.CERT_NONE
+    connector = aiohttp.TCPConnector(ssl=ssl_context)
+    
+    async with aiohttp.ClientSession(connector=connector) as session:
         async with session.post(auth_url, headers=headers, data=data) as resp:
             if resp.status != 200:
                 logger.error(f"Ошибка получения токена GigaChat: {resp.status}")
@@ -101,7 +109,7 @@ async def get_gigachat_token(creds: str, scope: str) -> str:
             return result.get("access_token")
 
 async def generate_gigachat_text(prompt: str, creds: str, scope: str) -> str:
-    """Генерация текста через GigaChat"""
+    """Генерация текста через GigaChat без проверки SSL"""
     token = await get_gigachat_token(creds, scope)
     if not token:
         return "Не удалось получить токен GigaChat"
@@ -120,7 +128,14 @@ async def generate_gigachat_text(prompt: str, creds: str, scope: str) -> str:
         "temperature": 0.9,
         "max_tokens": 500
     }
-    async with aiohttp.ClientSession() as session:
+    
+    # Снова создаём SSL-контекст для этого запроса
+    ssl_context = ssl.create_default_context()
+    ssl_context.check_hostname = False
+    ssl_context.verify_mode = ssl.CERT_NONE
+    connector = aiohttp.TCPConnector(ssl=ssl_context)
+    
+    async with aiohttp.ClientSession(connector=connector) as session:
         async with session.post(chat_url, headers=headers, json=payload) as resp:
             if resp.status != 200:
                 logger.error(f"Ошибка GigaChat: {resp.status}")
@@ -261,7 +276,7 @@ async def admin_gen_post(message: types.Message):
         await status_msg.edit_text(f"❌ Не удалось сгенерировать текст. Ошибка: {generated_text}")
         return
 
-    # --- 2. Генерация изображения через Pollinations.ai ---
+    # --- 2. Генерация изображения через Pollinations.ai (без ключа) ---
     image_prompt = f"nostalgic atmosphere, warm memory style, retro vibes, {topic}, cozy, detailed, 8k resolution, no text"
     encoded_prompt = urllib.parse.quote(image_prompt)
     image_url = f"https://image.pollinations.ai/prompt/{encoded_prompt}?width=1024&height=1024&nologo=true"
