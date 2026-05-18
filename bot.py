@@ -228,7 +228,7 @@ async def health_check_handler(request: web.Request) -> web.Response:
     return web.Response(status=200, text="OK")
 
 # --- Запуск веб-сервера и настройка вебхука ---
-async def on_startup() -> None:
+async def on_startup(app: web.Application) -> None:
     """Выполняется при запуске веб-сервера."""
     logger.info("Устанавливаем вебхук...")
     await bot.set_webhook(WEBHOOK_URL)
@@ -237,7 +237,7 @@ async def on_startup() -> None:
     # Запускаем фоновую задачу рассылки
     asyncio.create_task(daily_mailing())
 
-async def on_shutdown() -> None:
+async def on_shutdown(app: web.Application) -> None:
     """Выполняется при остановке веб-сервера."""
     logger.info("Удаляем вебхук...")
     await bot.delete_webhook()
