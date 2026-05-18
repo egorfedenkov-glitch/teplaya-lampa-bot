@@ -130,6 +130,7 @@ async def admin_add_content(message: types.Message):
 
     conn.commit()
     conn.close()
+    
 @dp.callback_query(lambda c: c.data == "howto")
 async def howto_callback(callback: types.CallbackQuery):
     await callback.message.answer(
@@ -142,6 +143,24 @@ async def howto_callback(callback: types.CallbackQuery):
         parse_mode=ParseMode.MARKDOWN
     )
     await callback.answer()
+
+@dp.message(Command('random'))
+async def random_memory(message: types.Message):
+    conn = sqlite3.connect('nostalgia.db')
+    c = conn.cursor()
+    c.execute('SELECT media_type, media_url, caption FROM content WHERE status="approved" ORDER BY RANDOM() LIMIT 1')
+    row = c.fetchone()
+    conn.close()
+    if not row:
+        await message.answer("Пока нет воспоминаний. Добавьте первое через /add")
+        return
+    media_type, media_url, caption = row
+    if media_type == 'photo':
+        await message.answer_photo(media_url, caption=caption)
+    elif media_type == 'gif':
+        await message.answer_animation(media_url, caption=caption)
+    else:
+        await message.answer(f"🕯 *Воспоминание*\n\n{caption}", parse_mode='Markdown')
 
 @dp.callback_query(lambda c: c.data == "add_memory")
 async def add_memory_callback(callback: types.CallbackQuery):
