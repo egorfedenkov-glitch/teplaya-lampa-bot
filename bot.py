@@ -4,42 +4,42 @@ import os
 import sqlite3
 import datetime
 import random
-import aiohttp
-import time
+import io
+import urllib.parse
+import uuid
 
-# --- Библиотеки для асинхронности, веб-сервера и бота ---
+# --- Библиотеки для веб-сервера и бота ---
 from aiohttp import web
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
 from aiogram.types import Update
 from aiogram.enums import ParseMode
 
-# Импорт datetime с учётом временной зоны
+# --- Для работы с временными зонами ---
 from datetime import datetime as dt
 import pytz
 
-# --- Настройки ---
-TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")  # Токен из переменной окружения
+# ========== НАСТРОЙКИ ==========
+TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 WEBHOOK_PATH = "/webhook"
 PORT = int(os.environ.get("PORT", 8000))
 
-# Render передаёт публичный URL сервиса через эту переменную
 RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL")
 if not RENDER_EXTERNAL_URL:
-    logging.error("Переменная окружения RENDER_EXTERNAL_URL не установлена!")
+    logging.error("RENDER_EXTERNAL_URL not set!")
     exit(1)
 
 WEBHOOK_URL = f"{RENDER_EXTERNAL_URL}{WEBHOOK_PATH}"
 
-# --- Настройка логирования ---
+# --- Логирование ---
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# --- Инициализация бота и диспетчера ---
+# --- Бот и диспетчер ---
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
 
-# --- Работа с базой данных ---
+# ========== РАБОТА С БАЗОЙ ДАННЫХ ==========
 def init_db():
     conn = sqlite3.connect('nostalgia.db')
     c = conn.cursor()
@@ -70,7 +70,6 @@ def init_db():
     logger.info("База данных инициализирована")
 
 def add_user(user_id, username, first_name):
-    """Добавляет пользователя, если его нет, или обновляет время активности."""
     conn = sqlite3.connect('nostalgia.db')
     c = conn.cursor()
     c.execute('''
@@ -82,7 +81,57 @@ def add_user(user_id, username, first_name):
 
 init_db()
 
-# ========== ОСНОВНЫЕ КОМАНДЫ ==========
+# ========== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ДЛЯ GigaChat ==========
+async def get_gigachat_token(creds: str, scope: str) -> str:
+    """Получение токена доступа GigaChat"""
+    auth_url = "https://ngw.devices.sberbank.ru:9443/api/v2/oauth"
+    headers = {
+        "Authorization": f"Bearer {creds}",
+        "Content-Type": "application/x-www-form-urlencoded",
+        "RqUID": str(uuid.uuid4())
+    }
+    data = {"scope": scope}
+    async with aiohttp.ClientSession() as session:
+        async with session.post(auth_url, headers=headers, data=data) as resp:
+            if resp.status != 200:
+                logger.error(f"Ошибка получения токена GigaChat: {resp.status}")
+                return None
+            result = await resp.json()
+            return result.get("access_token")
+
+async def generate_gigachat_text(prompt: str, creds: str, scope: str) -> str:
+    """Генерация текста через GigaChat"""
+    token = await get_gigachat_token(creds, scope)
+    if not token:
+        return "Не удалось получить токен GigaChat"
+    
+    chat_url = "https://gigachat.devices.sberbank.ru/api/v1/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "model": "GigaChat",
+        "messages": [
+            {"role": "system", "content": "Ты — профессиональный копирайтер для ностальгического Telegram-канала. Пиши тёплые, душевные посты от первого лица."},
+            {"role": "user", "content": prompt}
+        ],
+        "temperature": 0.9,
+        "max_tokens": 500
+    }
+    async with aiohttp.ClientSession() as session:
+        async with session.post(chat_url, headers=headers, json=payload) as resp:
+            if resp.status != 200:
+                logger.error(f"Ошибка GigaChat: {resp.status}")
+                return "Ошибка при генерации текста"
+            result = await resp.json()
+            if "choices" in result and len(result["choices"]) > 0:
+                return result["choices"][0]["message"]["content"]
+            else:
+                logger.error(f"Неожиданный ответ GigaChat: {result}")
+                return "Не удалось сгенерировать текст"
+
+# ========== ОСНОВНЫЕ КОМАНДЫ БОТА ==========
 @dp.message(Command('start'))
 async def start_cmd(message: types.Message):
     user = message.from_user
@@ -106,7 +155,6 @@ async def start_cmd(message: types.Message):
 @dp.message(Command('subscribe'))
 async def subscribe_cmd(message: types.Message):
     user = message.from_user
-    # Убедимся, что пользователь есть в базе
     add_user(user.id, user.username, user.first_name)
     conn = sqlite3.connect('nostalgia.db')
     c = conn.cursor()
@@ -146,8 +194,8 @@ async def random_memory(message: types.Message):
     else:
         await message.answer(f"🕯 *Воспоминание*\n\n{caption}", parse_mode='Markdown')
 
-# ========== АДМИН-КОМАНДА (добавление контента) ==========
-ADMIN_ID = 298207628  # Ваш Telegram ID
+# ========== АДМИНСКАЯ КОМАНДА ДЛЯ ДОБАВЛЕНИЯ КОНТЕНТА ==========
+ADMIN_ID = 298207628  # ЗАМЕНИТЕ НА ВАШ TELEGRAM ID
 
 @dp.message(Command('add'))
 async def admin_add_content(message: types.Message):
@@ -179,6 +227,81 @@ async def admin_add_content(message: types.Message):
     conn.commit()
     conn.close()
 
+# ========== КОМАНДА /gen С ИИ-ГЕНЕРАЦИЕЙ (GigaChat + Pollinations) ==========
+@dp.message(Command('gen'))
+async def admin_gen_post(message: types.Message):
+    if message.from_user.id != ADMIN_ID:
+        await message.answer("⛔ У вас нет прав на эту команду.")
+        return
+
+    topic = message.text.replace('/gen', '').strip()
+    if not topic:
+        await message.answer("❌ Укажите тему поста.\nПример: `/gen Воспоминания о видеосалонах`", parse_mode="Markdown")
+        return
+
+    # Получаем переменные окружения для GigaChat
+    GIGACHAT_CREDENTIALS = os.environ.get("GIGACHAT_CREDENTIALS")
+    GIGACHAT_SCOPE = os.environ.get("GIGACHAT_SCOPE", "GIGACHAT_API_PERS")
+    if not GIGACHAT_CREDENTIALS:
+        await message.answer("⚠️ API-ключ GigaChat не настроен. Добавьте переменную GIGACHAT_CREDENTIALS в Render.")
+        return
+
+    status_msg = await message.answer(f"🤖 Генерирую пост на тему *{topic}*...\n⏳ Обычно это занимает 15–30 секунд.", parse_mode="Markdown")
+
+    # --- 1. Генерация текста через GigaChat ---
+    text_prompt = f"""
+    Тема поста: "{topic}".
+    Напиши небольшой, цепляющий пост для Telegram-канала о ностальгии. 
+    Пост должен быть от первого лица, в разговорном стиле, вызывать тёплые эмоции.
+    Длина — от 150 до 300 символов. Не используй markdown.
+    """
+    generated_text = await generate_gigachat_text(text_prompt, GIGACHAT_CREDENTIALS, GIGACHAT_SCOPE)
+    
+    if not generated_text or "Ошибка" in generated_text or "Не удалось" in generated_text:
+        await status_msg.edit_text(f"❌ Не удалось сгенерировать текст. Ошибка: {generated_text}")
+        return
+
+    # --- 2. Генерация изображения через Pollinations.ai (без ключа) ---
+    image_prompt = f"nostalgic atmosphere, warm memory style, retro vibes, {topic}, cozy, detailed, 8k resolution, no text"
+    encoded_prompt = urllib.parse.quote(image_prompt)
+    image_url = f"https://image.pollinations.ai/prompt/{encoded_prompt}?width=1024&height=1024&nologo=true"
+    
+    conn = sqlite3.connect('nostalgia.db')
+    c = conn.cursor()
+    async with aiohttp.ClientSession() as session:
+        try:
+            async with session.get(image_url, timeout=30) as resp:
+                if resp.status == 200:
+                    image_data = await resp.read()
+                    # Сохраняем в БД с типом photo и URL (можно сохранить и локально, но URL рабочий)
+                    c.execute('INSERT INTO content (media_type, media_url, caption, status) VALUES (?, ?, ?, ?)',
+                              ('photo', image_url, generated_text, 'approved'))
+                    conn.commit()
+                    await message.answer_photo(
+                        photo=types.BufferedInputFile(image_data, filename="nostalgia.jpg"),
+                        caption=f"✨ *Сгенерированный пост:*\n\n{generated_text}\n\n✅ Пост сохранён в БД и готов к рассылке!",
+                        parse_mode="Markdown"
+                    )
+                else:
+                    # Если картинку не получили, сохраняем только текст
+                    c.execute('INSERT INTO content (media_type, caption, status) VALUES (?, ?, ?)',
+                              ('text', generated_text, 'approved'))
+                    conn.commit()
+                    await message.answer(f"✨ *Сгенерированный текст:*\n\n{generated_text}\n\n⚠️ Изображение не загрузилось, но текст сохранён.", parse_mode="Markdown")
+        except asyncio.TimeoutError:
+            c.execute('INSERT INTO content (media_type, caption, status) VALUES (?, ?, ?)',
+                      ('text', generated_text, 'approved'))
+            conn.commit()
+            await message.answer(f"✨ *Сгенерированный текст:*\n\n{generated_text}\n\n⚠️ Таймаут при генерации изображения, текст сохранён.", parse_mode="Markdown")
+        except Exception as e:
+            logger.error(f"Ошибка Pollinations: {e}")
+            c.execute('INSERT INTO content (media_type, caption, status) VALUES (?, ?, ?)',
+                      ('text', generated_text, 'approved'))
+            conn.commit()
+            await message.answer(f"✨ *Сгенерированный текст:*\n\n{generated_text}\n\n⚠️ Ошибка генерации изображения, текст сохранён.", parse_mode="Markdown")
+    conn.close()
+    await status_msg.delete()
+
 # ========== CALLBACK-ЗАПРОСЫ ==========
 @dp.callback_query(lambda c: c.data == "howto")
 async def howto_callback(callback: types.CallbackQuery):
@@ -207,7 +330,6 @@ async def add_memory_callback(callback: types.CallbackQuery):
 @dp.callback_query(lambda c: c.data == "unsubscribe")
 async def unsubscribe_callback(callback: types.CallbackQuery):
     user = callback.from_user
-    # Сначала убедимся, что пользователь есть в базе (на всякий случай)
     add_user(user.id, user.username, user.first_name)
     conn = sqlite3.connect('nostalgia.db')
     c = conn.cursor()
@@ -217,7 +339,7 @@ async def unsubscribe_callback(callback: types.CallbackQuery):
     await callback.message.answer("🔕 Ты отписался от вечерней рассылки. Если захочешь вернуться — напиши /subscribe")
     await callback.answer()
 
-# ========== ОБРАБОТЧИК МЕДИА (пользовательские воспоминания) ==========
+# ========== ОБРАБОТЧИК МЕДИА (ПОЛЬЗОВАТЕЛЬСКИЕ ВОСПОМИНАНИЯ) ==========
 @dp.message(lambda msg: msg.photo or msg.animation)
 async def handle_media_memory(message: types.Message):
     if message.photo:
@@ -238,7 +360,7 @@ async def handle_media_memory(message: types.Message):
     conn.close()
     await message.answer("Твоё медиа-воспоминание сохранено и будет проверено модератором. Спасибо за вклад в общую копилку!")
 
-# ========== ЕЖЕДНЕВНАЯ РАССЫЛКА ==========
+# ========== ЕЖЕДНЕВНАЯ РАССЫЛКА (в 20:00 МСК) ==========
 async def daily_mailing():
     moscow_tz = pytz.timezone('Europe/Moscow')
     while True:
@@ -285,19 +407,19 @@ async def webhook_handler(request: web.Request) -> web.Response:
         await dp.feed_update(bot, update)
         return web.Response(status=200)
     except Exception as e:
-        logger.error(f"Ошибка при обработке вебхука: {e}")
+        logger.error(f"Ошибка вебхука: {e}")
         return web.Response(status=500)
 
 async def health_check_handler(request: web.Request) -> web.Response:
     return web.Response(status=200, text="OK")
 
-async def on_startup(app: web.Application) -> None:
+async def on_startup(app: web.Application):
     logger.info("Устанавливаем вебхук...")
     await bot.set_webhook(WEBHOOK_URL)
     logger.info(f"Вебхук установлен на {WEBHOOK_URL}")
     asyncio.create_task(daily_mailing())
 
-async def on_shutdown(app: web.Application) -> None:
+async def on_shutdown(app: web.Application):
     logger.info("Удаляем вебхук...")
     await bot.delete_webhook()
     logger.info("Вебхук удалён.")
@@ -312,114 +434,3 @@ if __name__ == "__main__":
 
     logger.info(f"Запуск приложения на порту {PORT}")
     web.run_app(app, host="0.0.0.0", port=PORT)
-
-# --- Функция для генерации текста через GigaChat (остаётся без изменений) ---
-async def generate_gigachat_text(prompt: str, api_key: str) -> str:
-    url = "https://gigachat.devices.sberbank.ru/api/v1/chat/completions"
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json"
-    }
-    payload = {
-        "model": "GigaChat",
-        "messages": [
-            {"role": "system", "content": "Ты — профессиональный копирайтер, генерирующий уютные и ностальгические посты для Telegram."},
-            {"role": "user", "content": prompt}
-        ],
-        "temperature": 0.9,
-        "max_tokens": 500
-    }
-    async with aiohttp.ClientSession() as session:
-        async with session.post(url, headers=headers, json=payload) as resp:
-            result = await resp.json()
-            if 'choices' in result:
-                return result['choices'][0]['message']['content']
-            else:
-                return "Не удалось сгенерировать текст."
-
-# --- НОВАЯ КОМАНДА /gen с Pollinations.ai ---
-@dp.message(Command('gen'))
-async def admin_gen_post(message: types.Message):
-    # Проверка прав админа
-    if message.from_user.id != ADMIN_ID:
-        await message.answer("⛔ У вас нет прав на эту команду.")
-        return
-
-    # Получаем тему
-    topic = message.text.replace('/gen', '').strip()
-    if not topic:
-        await message.answer("❌ Укажите тему поста.\nПример: `/gen Воспоминания о видеосалонах`", parse_mode="Markdown")
-        return
-
-    # Проверяем API-ключ GigaChat
-    GIGACHAT_API_KEY = os.environ.get("GIGACHAT_API_KEY")
-    if not GIGACHAT_API_KEY:
-        await message.answer("⚠️ API-ключ GigaChat не настроен. Добавьте его в переменные окружения Render.")
-        return
-
-    # Уведомляем о начале работы
-    status_message = await message.answer(f"🤖 Генерирую пост на тему: *{topic}*...\n\n⏳ Это может занять до 30 секунд.", parse_mode="Markdown")
-
-    # --- 1. Генерируем текст через GigaChat ---
-    text_prompt = f"""
-    Ты — профессиональный копирайтер, ведущий уютный телеграм-канал о ностальгии. 
-    Напиши небольшой, цепляющий пост на русском языке на тему: "{topic}".
-    Пост должен быть написан от первого лица, в разговорном стиле, вызывать тёплые эмоции.
-    Длина поста — от 150 до 300 символов.
-    """
-    generated_text = await generate_gigachat_text(text_prompt, GIGACHAT_API_KEY)
-    
-    if not generated_text or generated_text == "Не удалось сгенерировать текст.":
-        await status_message.edit_text("❌ Не удалось сгенерировать текст. Попробуйте позже.")
-        return
-
-    # --- 2. Генерируем изображение через Pollinations.ai (без ключа) ---
-    # Формируем промпт на английском для лучшего качества
-    image_prompt = f"nostalgic atmosphere, warm memory style, retro vibes, {topic}, cozy, detailed, 8k resolution, no text"
-    # Кодируем промпт для URL
-    import urllib.parse
-    encoded_prompt = urllib.parse.quote(image_prompt)
-    image_url = f"https://image.pollinations.ai/prompt/{encoded_prompt}?width=1024&height=1024&nologo=true"
-    
-    # Скачиваем изображение по ссылке
-    async with aiohttp.ClientSession() as session:
-        try:
-            async with session.get(image_url) as resp:
-                if resp.status == 200:
-                    image_data = io.BytesIO(await resp.read())
-                    # Сохраняем в базу данных
-                    conn = sqlite3.connect('nostalgia.db')
-                    c = conn.cursor()
-                    c.execute('INSERT INTO content (media_type, media_url, caption, status) VALUES (?, ?, ?, ?)',
-                              ('photo', image_url, generated_text, 'approved'))
-                    conn.commit()
-                    conn.close()
-                    
-                    # Отправляем результат админу
-                    await message.answer_photo(
-                        photo=types.BufferedInputFile(image_data.getvalue(), filename="nostalgia.jpg"),
-                        caption=f"✨ *Сгенерированный пост:*\n\n{generated_text}\n\n✅ Пост сохранён в БД и готов к рассылке!",
-                        parse_mode="Markdown"
-                    )
-                    await status_message.delete()
-                else:
-                    # Если картинку не удалось получить, сохраняем только текст
-                    conn = sqlite3.connect('nostalgia.db')
-                    c = conn.cursor()
-                    c.execute('INSERT INTO content (media_type, caption, status) VALUES (?, ?, ?)',
-                              ('text', generated_text, 'approved'))
-                    conn.commit()
-                    conn.close()
-                    await message.answer(f"✨ *Сгенерированный текст:*\n\n{generated_text}\n\n⚠️ Изображение не удалось загрузить, но текст сохранён в БД.", parse_mode="Markdown")
-                    await status_message.delete()
-        except Exception as e:
-            logger.error(f"Ошибка при запросе к Pollinations: {e}")
-            # В случае ошибки сохраняем только текст
-            conn = sqlite3.connect('nostalgia.db')
-            c = conn.cursor()
-            c.execute('INSERT INTO content (media_type, caption, status) VALUES (?, ?, ?)',
-                      ('text', generated_text, 'approved'))
-            conn.commit()
-            conn.close()
-            await message.answer(f"✨ *Сгенерированный текст:*\n\n{generated_text}\n\n✅ Текст сохранён в БД (изображение не сгенерировано из-за технической ошибки).", parse_mode="Markdown")
-            await status_message.delete()
